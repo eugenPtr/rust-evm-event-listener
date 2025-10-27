@@ -15,6 +15,9 @@
 
 */
 
+mod utils;
+mod provider_pool;
+
 use alloy::{
     primitives::Address,
     providers::{Provider, ProviderBuilder, WsConnect},
@@ -30,6 +33,8 @@ use std::{
     time::Duration,
 };
 use tokio::time::timeout;
+use utils::calculate_backoff;
+use provider_pool::ProviderPool;
 
 const MAX_RETRIES: u32 = 5;
 const WS_CONNECTION_TIMEOUT_SECS: u64 = 60;  // 1 minute
@@ -75,13 +80,8 @@ impl Config {
     }
 }
 
-fn calculate_backoff(attempt: u32) -> Duration {
-    let base_ms = 1000u64.saturating_mul(2u64.pow(attempt)).min(60000);
-    Duration::from_millis(base_ms)
-}
-
-async fn backfill_events(
-    http_provider: impl Provider,
+async fn backfill_events<P: Provider>(
+    http_provider_pool: Arc<ProviderPool<P>>,
     last_processed_block: u64,
     current_block: u64,
     contract_address: &str,
@@ -100,7 +100,12 @@ async fn backfill_events(
             .from_block(from_block)
             .to_block(to_block);
 
-        match http_provider.get_logs(&filter).await {
+        match http_provider_pool.with_retry(MAX_RETRIES, |provider| {
+            let filter = filter.clone();
+            async move {
+                provider.get_logs(&filter).await
+            }
+        }).await {
             Ok(logs) => {
                 println!("Backfilled {} events from blocks {}-{}", logs.len(), from_block, to_block);
 
@@ -134,9 +139,7 @@ async fn backfill_events(
 async fn connect_ws(
     ws_provider: &impl Provider,
     contract_address: &str,
-) -> eyre::Result<(
-    std::pin::Pin<Box<dyn futures_util::stream::Stream<Item = alloy::rpc::types::Log> + Send + 'static>>
-)> {
+) -> eyre::Result<std::pin::Pin<Box<dyn futures_util::stream::Stream<Item = alloy::rpc::types::Log> + Send + 'static>>> {
     let contract_address: Address = contract_address
         .parse()
         .context("Invalid contract address")?;
@@ -155,30 +158,39 @@ async fn connect_ws(
     Ok(stream)
 }
 
-async fn get_rpc_providers(
+fn initialize_http_provider_pool(config: &Config) -> Arc<ProviderPool<impl Provider>> {
+    let primary_http_url = format!("https://{}", config.rpc_url);
+    let fallback_http_url = format!("https://{}", config.fallback_rpc_url);
+
+    let primary_http_provider = ProviderBuilder::new()
+        .connect_http(primary_http_url.parse().unwrap());
+    let fallback_http_provider = ProviderBuilder::new()
+        .connect_http(fallback_http_url.parse().unwrap());
+
+    Arc::new(ProviderPool::new(vec![primary_http_provider, fallback_http_provider]))
+}
+
+/*
+    Cycles between primary and fallback WebSocket RPC URLs based on the attempt number
+*/
+async fn get_ws_provider(
     config: &Config,
     attempt: &u32,
-) -> (impl Provider, impl Provider) {
+) -> impl Provider {
+
     let rpc_url = if *attempt % 2 == 0 {
         &config.rpc_url
     } else {
         &config.fallback_rpc_url
     };
 
-    // Fetch latest block via HTTP before starting WebSocket connection
-    let http_url = format!("https://{}", rpc_url);
-    let http_provider = ProviderBuilder::new()
-        .connect_http(http_url.parse().unwrap());
-
     let ws_url = format!("wss://{}", rpc_url);
     let ws = WsConnect::new(&ws_url);
-    let ws_provider = ProviderBuilder::new()
+    ProviderBuilder::new()
         .connect_ws(ws)
         .await
         .context("Failed to connect to WebSocket")
-        .unwrap();
-
-    (ws_provider, http_provider)
+        .unwrap()
 }
 
 /*
@@ -186,13 +198,13 @@ async fn get_rpc_providers(
     For this POC, we initialize it to the current block number from the RPC
     !!! In production, this value would be fetched from a database
 */
-async fn get_last_processed_block(config: &Config) -> Arc<Mutex<u64>> {
-    let http_url = format!("https://{}", config.rpc_url);
-    let http_provider = ProviderBuilder::new()
-        .connect_http(http_url.parse().unwrap());
-
-    let current_block = http_provider
-        .get_block_number()
+async fn get_last_processed_block<P: Provider>(
+    http_provider_pool: Arc<ProviderPool<P>>
+) -> Arc<Mutex<u64>> {
+    let current_block = http_provider_pool
+        .with_retry(MAX_RETRIES, |provider| async move {
+            provider.get_block_number().await
+        })
         .await
         .context("Failed to fetch latest block via HTTP").unwrap();
 
@@ -212,7 +224,10 @@ async fn main() -> Result<()> {
     println!("RPC URL: {}", config.rpc_url);
     println!("Fallback RPC URL: {}", config.fallback_rpc_url);
 
-    let last_processed_block = get_last_processed_block(&config).await;
+    // Initialize HTTP provider pool once for the entire application lifecycle
+    let http_provider_pool = initialize_http_provider_pool(&config);
+
+    let last_processed_block = get_last_processed_block(http_provider_pool.clone()).await;
 
     let mut attempt = 0;
     loop {
@@ -221,7 +236,7 @@ async fn main() -> Result<()> {
             break;
         }
 
-        let (ws_provider, http_provider) = get_rpc_providers(&config, &attempt).await;
+        let ws_provider = get_ws_provider(&config, &attempt).await;
 
         let mut event_stream = match connect_ws(&ws_provider, &config.contract_address).await {
             Ok(stream) => {
@@ -238,8 +253,10 @@ async fn main() -> Result<()> {
             }
         };
 
-        let current_block = http_provider
-            .get_block_number()
+        let current_block = http_provider_pool
+            .with_retry(MAX_RETRIES, |provider| async move {
+                provider.get_block_number().await
+            })
             .await
             .context("Failed to fetch latest block via HTTP")?;
 
@@ -250,10 +267,11 @@ async fn main() -> Result<()> {
         let backfill_from = *last_processed_block.lock().unwrap();
         if backfill_to > backfill_from {
             let address = config.contract_address.clone();
+            let pool_clone = http_provider_pool.clone();
 
             // Backfill task is handed to the runtime. It is executed asynchronously evenif the loop continues due to ws disconnection
             tokio::spawn(async move {
-                if let Err(e) = backfill_events(http_provider, backfill_from, backfill_to, &address).await {
+                if let Err(e) = backfill_events(pool_clone, backfill_from, backfill_to, &address).await {
                     eprintln!("Backfill error: {:?}", e);
                 }
             });
