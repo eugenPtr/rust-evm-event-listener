@@ -43,11 +43,7 @@ cargo run
 
 ## How It Works
 
-1. **Initialization**: Loads environment variables and initializes HTTP provider pool
-2. **WebSocket Connection**: Connects to Ethereum node via WebSocket and subscribes to Transfer events
-3. **Event Listening**: Monitors incoming Transfer events in real-time
-4. **Backfilling**: On reconnection, queries historical logs for missed events during downtime
-5. **Automatic Reconnection**: On disconnection, waits with exponential backoff and reconnects using alternate provider
+See comments at the top of the source files
 
 ## License
 
