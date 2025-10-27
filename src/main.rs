@@ -17,6 +17,7 @@
 
 mod utils;
 mod provider_pool;
+mod constants;
 
 use alloy::{
     primitives::Address,
@@ -35,12 +36,7 @@ use std::{
 use tokio::time::timeout;
 use utils::calculate_backoff;
 use provider_pool::ProviderPool;
-
-const MAX_RETRIES: u32 = 5;
-const WS_CONNECTION_TIMEOUT_SECS: u64 = 60;  // 1 minute
-const RECONNECT_DELAY_SECS: u64 = 60;         // 1 minute
-const BACKFILL_BATCH_SIZE: u64 = 9;      // Number of blocks to backfill at once
-const TRANSFER_EVENT_SIGNATURE: &str = "Transfer(address,address,uint256)";
+use constants::*;
 
 // Define the ERC20 Transfer event using the sol! macro
 // This generates a Transfer struct with from, to, and value fields
@@ -63,25 +59,15 @@ struct Config {
     rpc_url: String,
     /// Fallback RPC URL (without protocol prefix)
     fallback_rpc_url: String,
-    /// Contract address to monitor for events
-    contract_address: Address,
 }
 
 impl Config {
     fn from_env() -> Result<Self> {
-        let contract_address_str = std::env::var("CONTRACT_ADDRESS")
-            .context("CONTRACT_ADDRESS environment variable not set")?;
-
-        let contract_address: Address = contract_address_str
-            .parse()
-            .context("Invalid CONTRACT_ADDRESS format")?;
-
         Ok(Config {
             rpc_url: std::env::var("RPC_URL")
                 .context("RPC_URL environment variable not set")?,
             fallback_rpc_url: std::env::var("FALLBACK_RPC_URL")
                 .context("FALLBACK_RPC_URL environment variable not set")?,
-            contract_address,
         })
     }
 }
@@ -235,7 +221,8 @@ async fn main() -> Result<()> {
         }
 
         let rpc_url = select_rpc_url(&config, attempt);
-        let (_ws_provider, mut event_stream) = match establish_event_stream(config.contract_address, rpc_url).await {
+        let contract_address: Address = CONTRACT_ADDRESS.parse().expect("Invalid CONTRACT_ADDRESS constant");
+        let (_ws_provider, mut event_stream) = match establish_event_stream(contract_address, rpc_url).await {
             Ok(result) => {
                 attempt = 0;
                 result
@@ -268,7 +255,7 @@ async fn main() -> Result<()> {
             p.into_inner()
         });
         if backfill_to > backfill_from {
-            let contract_address = config.contract_address;
+            let contract_address: Address = CONTRACT_ADDRESS.parse().expect("Invalid CONTRACT_ADDRESS constant");
             let pool_clone = http_provider_pool.clone();
 
             // Backfill task is handed to the runtime. It is executed asynchronously evenif the loop continues due to ws disconnection
