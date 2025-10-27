@@ -8,7 +8,7 @@ pub const WS_CONNECTION_TIMEOUT_SECS: u64 = 60;
 pub const RECONNECT_DELAY_SECS: u64 = 60;
 
 /// Number of blocks to backfill at once
-pub const BACKFILL_BATCH_SIZE: u64 = 9;
+pub const BACKFILL_BATCH_SIZE: u64 = 9;  // Alchemy free tier allows 10 blocks per request
 
 /// Transfer event signature
 pub const TRANSFER_EVENT_SIGNATURE: &str = "Transfer(address,address,uint256)";

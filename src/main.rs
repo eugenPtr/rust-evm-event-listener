@@ -3,9 +3,10 @@
 
    Implements the following features:
     - attempts to reconnect on WebSocket disconnections using exponential backoff
-    - alternates between primary and fallback RPC URLs on each reconnection attempt
+        - reconnection attempts use alternating RPC URLs (primary and fallback)
     - backfills any missed events during downtime by polling past logs from the RPC provider
-    - backfills events in batches to avoid overwhelming the RPC provider (configurable via BACKFILL_BATCH_SIZE)
+        - backfills events in batches (configurable via BACKFILL_BATCH_SIZE)
+        - backfills rely on a pool of HTTP providers with retry and rotation logic to ensure reliability (it was fun to implement!)
     - stores the last processed block number in memory
 
     For demonstration purposes:
@@ -220,6 +221,7 @@ async fn main() -> Result<()> {
             break;
         }
 
+        // Select between primary and fallback RPC URLs on each attempt
         let rpc_url = select_rpc_url(&config, attempt);
         let contract_address: Address = CONTRACT_ADDRESS.parse().expect("Invalid CONTRACT_ADDRESS constant");
         let (_ws_provider, mut event_stream) = match establish_event_stream(contract_address, rpc_url).await {
