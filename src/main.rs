@@ -64,18 +64,24 @@ struct Config {
     /// Fallback RPC URL (without protocol prefix)
     fallback_rpc_url: String,
     /// Contract address to monitor for events
-    contract_address: String,
+    contract_address: Address,
 }
 
 impl Config {
     fn from_env() -> Result<Self> {
+        let contract_address_str = std::env::var("CONTRACT_ADDRESS")
+            .context("CONTRACT_ADDRESS environment variable not set")?;
+
+        let contract_address: Address = contract_address_str
+            .parse()
+            .context("Invalid CONTRACT_ADDRESS format")?;
+
         Ok(Config {
             rpc_url: std::env::var("RPC_URL")
                 .context("RPC_URL environment variable not set")?,
             fallback_rpc_url: std::env::var("FALLBACK_RPC_URL")
                 .context("FALLBACK_RPC_URL environment variable not set")?,
-            contract_address: std::env::var("CONTRACT_ADDRESS")
-                .context("CONTRACT_ADDRESS environment variable not set")?,
+            contract_address,
         })
     }
 }
@@ -84,19 +90,18 @@ async fn backfill_events<P: Provider>(
     http_provider_pool: Arc<ProviderPool<P>>,
     last_processed_block: u64,
     current_block: u64,
-    contract_address: &str,
+    contract_address: Address,
 ) -> Result<()> {
     println!("Backfilling events from block {} to {}", last_processed_block, current_block);
 
-    let address: Address = contract_address.parse()?;
     let mut from_block = last_processed_block + 1;
 
     while from_block <= current_block {
         let to_block = (from_block + BACKFILL_BATCH_SIZE).min(current_block);
 
         let filter = Filter::new()
-            .address(address)
-            .event("Transfer(address,address,uint256)")
+            .address(contract_address)
+            .event(TRANSFER_EVENT_SIGNATURE)
             .from_block(from_block)
             .to_block(to_block);
 
@@ -118,7 +123,7 @@ async fn backfill_events<P: Provider>(
                                 value: event.value.to_string(),
                             };
                             if let Ok(json) = serde_json::to_string(&json_event) {
-                                println!("[Block {}] Backfill Transfer: {}", log.block_number.unwrap(), json);
+                                println!("[Block {}] Backfill Transfer: {}", log.block_number.unwrap_or(0), json);
                             }
                         }
                         Err(e) => eprintln!("Decode error: {:?}", e),
@@ -136,13 +141,42 @@ async fn backfill_events<P: Provider>(
     Ok(())
 }
 
-async fn connect_ws(
-    ws_provider: &impl Provider,
-    contract_address: &str,
-) -> eyre::Result<std::pin::Pin<Box<dyn futures_util::stream::Stream<Item = alloy::rpc::types::Log> + Send + 'static>>> {
-    let contract_address: Address = contract_address
-        .parse()
-        .context("Invalid contract address")?;
+type Stream = std::pin::Pin<Box<dyn futures_util::stream::Stream<Item = alloy::rpc::types::Log> + Send + 'static>>;
+
+fn select_rpc_url<'a>(config: &'a Config, attempt: u32) -> &'a str {
+    if attempt % 2 == 0 {
+        &config.rpc_url
+    } else {
+        &config.fallback_rpc_url
+    }
+}
+
+fn initialize_http_provider_pool(config: &Config) -> Result<Arc<ProviderPool<impl Provider>>> {
+    let primary_http_url = format!("https://{}", config.rpc_url);
+    let fallback_http_url = format!("https://{}", config.fallback_rpc_url);
+
+    let primary_http_provider = ProviderBuilder::new()
+        .connect_http(primary_http_url.parse()?);
+    let fallback_http_provider = ProviderBuilder::new()
+        .connect_http(fallback_http_url.parse()?);
+
+    Ok(Arc::new(ProviderPool::new(vec![primary_http_provider, fallback_http_provider])))
+}
+
+/*
+    Establishes WebSocket connection and subscribes to Transfer events
+    Returns both the provider and the event stream
+*/
+async fn establish_event_stream(
+    contract_address: Address,
+    rpc_url: &str,
+) -> Result<(impl Provider, Stream)> {
+    let ws_url = format!("wss://{}", rpc_url);
+    let ws = WsConnect::new(&ws_url);
+    let ws_provider = ProviderBuilder::new()
+        .connect_ws(ws)
+        .await
+        .context("Failed to connect to WebSocket")?;
 
     let filter = Filter::new()
         .address(contract_address)
@@ -155,42 +189,7 @@ async fn connect_ws(
 
     let stream = subscription.into_stream().boxed();
 
-    Ok(stream)
-}
-
-fn initialize_http_provider_pool(config: &Config) -> Arc<ProviderPool<impl Provider>> {
-    let primary_http_url = format!("https://{}", config.rpc_url);
-    let fallback_http_url = format!("https://{}", config.fallback_rpc_url);
-
-    let primary_http_provider = ProviderBuilder::new()
-        .connect_http(primary_http_url.parse().unwrap());
-    let fallback_http_provider = ProviderBuilder::new()
-        .connect_http(fallback_http_url.parse().unwrap());
-
-    Arc::new(ProviderPool::new(vec![primary_http_provider, fallback_http_provider]))
-}
-
-/*
-    Cycles between primary and fallback WebSocket RPC URLs based on the attempt number
-*/
-async fn get_ws_provider(
-    config: &Config,
-    attempt: &u32,
-) -> impl Provider {
-
-    let rpc_url = if *attempt % 2 == 0 {
-        &config.rpc_url
-    } else {
-        &config.fallback_rpc_url
-    };
-
-    let ws_url = format!("wss://{}", rpc_url);
-    let ws = WsConnect::new(&ws_url);
-    ProviderBuilder::new()
-        .connect_ws(ws)
-        .await
-        .context("Failed to connect to WebSocket")
-        .unwrap()
+    Ok((ws_provider, stream))
 }
 
 /*
@@ -200,15 +199,15 @@ async fn get_ws_provider(
 */
 async fn get_last_processed_block<P: Provider>(
     http_provider_pool: Arc<ProviderPool<P>>
-) -> Arc<Mutex<u64>> {
+) -> Result<Arc<Mutex<u64>>> {
     let current_block = http_provider_pool
         .with_retry(MAX_RETRIES, |provider| async move {
             provider.get_block_number().await
         })
         .await
-        .context("Failed to fetch latest block via HTTP").unwrap();
+        .context("Failed to fetch last processed block")?;
 
-    Arc::new(Mutex::new(current_block))
+    Ok(Arc::new(Mutex::new(current_block)))
 }
 
 #[tokio::main]
@@ -221,13 +220,12 @@ async fn main() -> Result<()> {
         .context("Failed to load configuration")?;
 
     println!("Configuration loaded successfully");
-    println!("RPC URL: {}", config.rpc_url);
-    println!("Fallback RPC URL: {}", config.fallback_rpc_url);
 
     // Initialize HTTP provider pool once for the entire application lifecycle
-    let http_provider_pool = initialize_http_provider_pool(&config);
+    let http_provider_pool = initialize_http_provider_pool(&config).context("Failed to initialize HTTP provider pool")?;
 
-    let last_processed_block = get_last_processed_block(http_provider_pool.clone()).await;
+    let last_processed_block = get_last_processed_block(http_provider_pool.clone()).await?;
+    println!("Starting from last processed block: {}", *last_processed_block.lock().expect("Mutex poisoned. Restart the application."));
 
     let mut attempt = 0;
     loop {
@@ -236,12 +234,11 @@ async fn main() -> Result<()> {
             break;
         }
 
-        let ws_provider = get_ws_provider(&config, &attempt).await;
-
-        let mut event_stream = match connect_ws(&ws_provider, &config.contract_address).await {
-            Ok(stream) => {
-                attempt = 0; // Reset attempt counter on successful connection
-                stream
+        let rpc_url = select_rpc_url(&config, attempt);
+        let (_ws_provider, mut event_stream) = match establish_event_stream(config.contract_address, rpc_url).await {
+            Ok(result) => {
+                attempt = 0;
+                result
             }
             Err(e) => {
                 println!("✗ Reconnection attempt {} failed: {:?}", attempt + 1, e);
@@ -253,6 +250,8 @@ async fn main() -> Result<()> {
             }
         };
 
+        // If fetching the current block fails despite the multiple retries on multiple providers, the application will exit
+        // I chose ignore this scenario for the scope of this PoC
         let current_block = http_provider_pool
             .with_retry(MAX_RETRIES, |provider| async move {
                 provider.get_block_number().await
@@ -264,14 +263,17 @@ async fn main() -> Result<()> {
 
         // On successful connection, check for missed events
         let backfill_to = current_block;
-        let backfill_from = *last_processed_block.lock().unwrap();
+        let backfill_from = *last_processed_block.lock().unwrap_or_else(|p| {
+            eprintln!("⚠ Mutex poisoned: {:?}", p);
+            p.into_inner()
+        });
         if backfill_to > backfill_from {
-            let address = config.contract_address.clone();
+            let contract_address = config.contract_address;
             let pool_clone = http_provider_pool.clone();
 
             // Backfill task is handed to the runtime. It is executed asynchronously evenif the loop continues due to ws disconnection
             tokio::spawn(async move {
-                if let Err(e) = backfill_events(pool_clone, backfill_from, backfill_to, &address).await {
+                if let Err(e) = backfill_events(pool_clone, backfill_from, backfill_to, contract_address).await {
                     eprintln!("Backfill error: {:?}", e);
                 }
             });
@@ -291,11 +293,21 @@ async fn main() -> Result<()> {
                 };
 
                 if let Ok(json) = serde_json::to_string(&json_event) {
-                    println!("[Block {}] Live Transfer: {}", log.block_number.unwrap(), json);
+                    println!("[Block {}] Live Transfer: {}", log.block_number.unwrap_or(0), json);
                 }
 
-                let block_number = log.block_number.unwrap();
-                let mut last_block = last_processed_block.lock().unwrap();
+                let block_number = match log.block_number {
+                    Some(num) => num,
+                    None => {
+                        eprintln!("⚠ Received log without block_number, skipping state update");
+                        continue;  // Skip this event, continue loop
+                    }
+                };
+
+                let mut last_block = last_processed_block.lock().unwrap_or_else(|p| {
+                    eprintln!("⚠ Mutex poisoned: {:?}", p);
+                    p.into_inner()
+                });
                 *last_block = block_number;
             }
             Ok::<(), eyre::Report>(())
@@ -313,7 +325,10 @@ async fn main() -> Result<()> {
             }
         }
 
-        println!("Last processed block: {}", *last_processed_block.lock().unwrap());
+        println!("Last processed block: {}", *last_processed_block.lock().unwrap_or_else(|p| {
+            eprintln!("⚠ Mutex poisoned: {:?}", p);
+            p.into_inner()
+        }));
 
         // Wait before reconnecting
         println!("⏸ Waiting {} seconds before reconnecting...", RECONNECT_DELAY_SECS);
